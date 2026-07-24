@@ -756,45 +756,83 @@ def vigenere_guess_keylength(s, max_len=20):
             ordered.append(k)
     return ordered[:8]
 
-def vigenere_crack_column(col):
-    best_shift, best_score = 0, -1e9
+def _chi2_shift(col):
+    """Meilleur decalage d'une colonne par CHI-CARRE vs frequences anglaises
+    (methode standard Vigenere, bien plus fiable que english_score par colonne)."""
+    n = len(col)
+    if n == 0:
+        return 0
+    best_k, best_chi = 0, 1e18
     for k in range(26):
-        shifted = caesar_shift(col, k)
-        sc = english_score(shifted)
-        if sc > best_score:
-            best_score, best_shift = sc, k
-    return best_shift
+        cnt = Counter(chr((ord(c) - 97 - k) % 26 + 97) for c in col)
+        chi = 0.0
+        for ch in string.ascii_lowercase:
+            expected = _ENG_FREQ.get(ch, 0.02) / 100.0 * n
+            if expected > 0:
+                chi += (cnt.get(ch, 0) - expected) ** 2 / expected
+        if chi < best_chi:
+            best_chi, best_k = chi, k
+    return best_k
 
-def vigenere_crack(s, flag_re):
-    for klen in vigenere_guess_keylength(s):
-        letters_idx = [i for i, c in enumerate(s) if c.isalpha()]
-        clean = ''.join(s[i] for i in letters_idx)
-        key_shifts = []
-        for col in range(klen):
-            column = clean[col::klen]
-            key_shifts.append(vigenere_crack_column(column))
-        key = ''.join(chr(97 + k) for k in key_shifts)
-        decoded = list(s)
-        ki = 0
-        for i in letters_idx:
-            decoded[i] = caesar_shift(s[i], key_shifts[ki % klen])
+def _vig_decrypt(s, key):
+    ks = [ord(k) - 97 for k in key.lower() if k.isalpha()]
+    if not ks:
+        return s
+    res, ki = [], 0
+    for c in s:
+        if c.isalpha():
+            base = 65 if c.isupper() else 97
+            res.append(chr((ord(c) - base - ks[ki % len(ks)]) % 26 + base))
             ki += 1
-        cand = ''.join(decoded)
-        f = find_flag(cand, flag_re)
-        if f:
-            return f, key, cand
-        if english_score(cand) > 5:
-            return None, key, cand
-    return None, None, None
+        else:
+            res.append(c)
+    return ''.join(res)
+
+# cles Vigenere tres frequentes en CTF (les auteurs tapent souvent un mot)
+VIG_KEYS = ["key", "secret", "password", "flag", "cipher", "vigenere", "crypto",
+            "hidden", "cake", "lemon", "attack", "kryptos", "cryptography",
+            "admin", "letmein", "ctf", "hacker", "secretkey", "supersecret"]
+
+def vigenere_crack(s, flag_re, max_len=20):
+    clean = ''.join(c.lower() for c in s if c.isalpha())
+    if len(clean) < 4:
+        return None, None, None
+    cands = []
+    # 1) dictionnaire de cles courantes
+    for key in VIG_KEYS:
+        cands.append((key, _vig_decrypt(s, key)))
+    # 2) TOUTES les longueurs 1..max, chi-carre par colonne
+    for klen in range(1, min(max_len, len(clean)) + 1):
+        shifts = [_chi2_shift(clean[col::klen]) for col in range(klen)]
+        key = ''.join(chr(97 + k) for k in shifts)
+        cands.append((key, _vig_decrypt(s, key)))
+    # meilleur candidat (flag prioritaire, sinon meilleur score anglais)
+    return _best_flag_or_score(cands, flag_re)
 
 # ----------------------------------------------------------------------
 # COUCHE 4bis - Affine (bruteforce a*x+b) + Rail fence (transposition)
 # ----------------------------------------------------------------------
+# mots/trigrammes anglais tres frequents -> discriminent le VRAI clair du
+# charabia (la frequence de lettres seule ne suffit pas : une cle Vigenere trop
+# longue sur-ajuste chaque colonne et 'tte ghicu brewr' score comme 'the quick').
+_COMMON = [" the ", " and ", " for ", " that ", " with ", " this ", " you ",
+           " are ", " was ", " have ", " from ", " flag ", "the", "and", "ing",
+           "ion", "ent", "tio", "tha", "ere", "ate", "her", "hat", "his", "for",
+           "flag", "ctf", "key"]
+
+def word_fitness(text):
+    t = " " + text.lower() + " "
+    return sum(t.count(w) for w in _COMMON)
+
+def text_fitness(s):
+    """Score combine : frequence de lettres + presence de vrais mots anglais."""
+    return english_score(s) + 8.0 * word_fitness(s)
+
 def _best_flag_or_score(cands, flag_re):
     """cands = [(key, dec)]. Parmi les candidats qui matchent un flag, garde
-    celui au MEILLEUR english_score (evite un 'ctf{garbage}' coincidant sur un
-    mauvais decalage) ; sinon renvoie le meilleur score global."""
-    scored = [(k, d, english_score(d)) for k, d in cands]
+    celui au MEILLEUR score (evite un 'ctf{garbage}' coincidant) ; sinon renvoie
+    le meilleur score global. Utilise text_fitness (lettres + mots reels)."""
+    scored = [(k, d, text_fitness(d)) for k, d in cands]
     hits = [(k, d, sc) for k, d, sc in scored if find_flag(d, flag_re)]
     if hits:
         k, d, _ = max(hits, key=lambda x: x[2])
