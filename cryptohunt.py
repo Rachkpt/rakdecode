@@ -1137,8 +1137,10 @@ def iroot(n, k):
 
 def rsa_small_e_attack(n, e, c):
     """Si c = m^e mod n mais que m^e < n (pas de wraparound, message court /
-    pas de padding), alors m = racine e-ieme entiere de c. Classique CTF."""
-    if e > 11:
+    pas de padding), alors m = racine e-ieme entiere de c. Classique CTF.
+    NB : marche pour N'IMPORTE quel e (pas seulement 3) tant que m^e < n -
+    ex. picoCTF 'tiny e' avec e=20. Le check 'root**e == c' est le vrai garde-fou."""
+    if not e or e > 4096:
         return None
     root = iroot(c, e)
     if root ** e == c:
@@ -1345,19 +1347,6 @@ def rsa_solve(params, flag_re, use_factordb=True):
     primes = None
     if p and q:
         findings.append(("p/q deja fournis", p, q))
-    elif not (d_in or phi_in):
-        f = factor_n(n)                       # Fermat -> Pollard p-1 -> Pollard rho (offline)
-        if f:
-            p, q = f
-            findings.append(("factorise localement (Fermat/Pollard p-1/rho)", p, q))
-        elif use_factordb:
-            primes = factordb_lookup(n)
-            if primes and len(primes) == 2:
-                p, q = primes
-                findings.append(("FactorDB (deja connu publiquement)", p, q))
-            elif primes and len(primes) > 2:
-                findings.append((f"FactorDB : n multi-prime ({len(primes)} facteurs)",
-                                 primes[0], "..."))
 
     result = {"n": n, "e": e, "c": c, "p": p, "q": q, "flag": None,
               "plaintext": None, "method": None, "notes": findings}
@@ -1386,15 +1375,28 @@ def rsa_solve(params, flag_re, use_factordb=True):
         except Exception:
             pass
 
-    # 0bis) n multi-prime (>2 facteurs) -> phi = produit des (pi-1)
-    if c and e and primes and len(primes) > 2 and not result["plaintext"]:
-        _accept(rsa_multiprime(primes, e, c),
-                f"n multi-prime ({len(primes)} facteurs) -> phi = prod(pi-1)")
-
-    # 1) exposant petit sans padding (racine e-ieme)
+    # 1) exposant petit sans padding (racine e-ieme) - INSTANTANE, avant tout
+    #    factoring couteux (ex. picoCTF 'tiny e' e=20 : m^e < n -> racine directe)
     if e and c and not (p and q) and not result["plaintext"]:
         _accept(rsa_small_e_attack(n, e, c),
                 f"exposant petit (e={e}) sans padding, racine {e}-ieme entiere")
+
+    # 1bis) factorisation LOCALE puis en ligne, SEULEMENT si rien encore trouve
+    if e and c and not (p and q) and not (d_in or phi_in) and not result["plaintext"]:
+        f = factor_n(n)                       # Fermat -> Pollard p-1 -> Pollard rho
+        if f:
+            p, q = f
+            findings.append(("factorise localement (Fermat/Pollard p-1/rho)", p, q))
+        elif use_factordb:
+            primes = factordb_lookup(n)
+            if primes and len(primes) == 2:
+                p, q = primes
+                findings.append(("FactorDB (deja connu publiquement)", p, q))
+            elif primes and len(primes) > 2:
+                findings.append((f"FactorDB : n multi-prime ({len(primes)} facteurs)",
+                                 primes[0], "..."))
+                _accept(rsa_multiprime(primes, e, c),
+                        f"n multi-prime ({len(primes)} facteurs) -> phi = prod(pi-1)")
 
     # 2) factorisation connue -> dechiffrement direct
     if p and q and e and c and not result["plaintext"]:
