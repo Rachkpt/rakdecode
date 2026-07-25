@@ -700,38 +700,33 @@ def xor_crib_crack(data, flag_re, cribs=None):
     octets de la cle directement. BEAUCOUP plus fiable que l'analyse
     frequentielle seule quand le ciphertext est court (technique standard
     en CTF, plus fiable que la pure statistique)."""
+    # On COLLECTE tous les candidats valides (au lieu de renvoyer le premier)
+    # puis on garde celui au MEILLEUR text_fitness : le crib dragging peut forcer
+    # 'flag{' a n'importe quel offset, mais seule la VRAIE cle rend TOUT le texte
+    # lisible -> text_fitness le plus haut = le bon.
+    cands = []
     for crib in dict.fromkeys((cribs or []) + CRIB_WORDS):
         crib_b = crib.encode()
         if len(crib_b) > len(data):
             continue
         for offset in range(0, len(data) - len(crib_b) + 1):
-            frag = data[offset:offset + len(crib_b)]
-            key_frag = xor_bytes(frag, crib_b)
-            # le crib doit lui-meme couvrir au moins une pleine periode de
-            # cle pour qu'on puisse reconstruire la cle entiere -> on
-            # teste toutes les longueurs de cle <= longueur du crib
+            key_frag = xor_bytes(data[offset:offset + len(crib_b)], crib_b)
             for klen in range(1, len(crib_b) + 1):
                 key = bytes(key_frag[i % klen] for i in range(klen))
-                # verifie la coherence : le crib doit etre periodique de
-                # periode klen dans key_frag, sinon cette klen est fausse
-                if all(key_frag[i] == key[i % klen] for i in range(len(key_frag))):
-                    cand = xor_bytes(data, key)
-                    try:
-                        s = cand.decode('utf-8')
-                    except Exception:
-                        continue
-                    f = find_flag(s, flag_re)
-                    # Garde-fou : une cle CTF legitime est quasi toujours
-                    # une chaine IMPRIMABLE (l'auteur du challenge la tape
-                    # au clavier - 'ctf', 'secret123', etc.). Le faux
-                    # positif constate produisait une cle faite de
-                    # caracteres de controle purs (b'\x13\x02\x0c\x00\x1f')
-                    # -> filtre bien plus robuste qu'un seuil de score
-                    # arbitraire, qui finit toujours par matcher par hasard
-                    # sur assez de combinaisons offset x crib x longueur.
-                    key_printable = sum(1 for b in key if 32 <= b < 127) / len(key)
-                    if f and key_printable >= 0.8 and english_score(s) > -2.0:
-                        return f, key, s
+                if not all(key_frag[i] == key[i % klen] for i in range(len(key_frag))):
+                    continue
+                try:
+                    s = xor_bytes(data, key).decode('utf-8')
+                except Exception:
+                    continue
+                f = find_flag(s, flag_re)
+                # cle imprimable + flag PROPRE + tout le texte lisible (fitness>0)
+                key_printable = sum(1 for b in key if 32 <= b < 127) / len(key)
+                if f and _clean_flag(f) and key_printable >= 0.8 and text_fitness(s) > 0:
+                    cands.append((key, s, text_fitness(s)))
+    if cands:
+        key, s, _ = max(cands, key=lambda x: x[2])
+        return find_flag(s, flag_re), key, s
     return None, None, None
 
 # ----------------------------------------------------------------------
@@ -1660,11 +1655,17 @@ def run(args):
                     out(f"  {C.Y}[i] {note} : p={p}{C.X}")
                     out(f"  {C.Y}                 q={q}{C.X}")
             else:
+                if not rsa_params.get('c'):
+                    out(f"  {C.Y}[i] Pas de ciphertext 'c' fourni -> rien a dechiffrer "
+                        f"(ajoute 'c = ...' pour attaquer).{C.X}")
                 out(f"  {C.Y}[!] n non factorisable automatiquement (premiers trop grands/eloignes) "
-                    f"-> essaie RsaCtfTool (Wiener, Boneh-Durfee, etc.) :{C.X}")
-                out(f"  {C.CY}    certipy... non, ici : python3 RsaCtfTool.py -n {rsa_params.get('n','<n>')} "
+                    f"-> essaie RsaCtfTool (Wiener, Boneh-Durfee, ECM, etc.) :{C.X}")
+                out(f"  {C.CY}    python3 RsaCtfTool.py -n {rsa_params.get('n','<n>')} "
                     f"-e {rsa_params.get('e','<e>')} --uncipher {rsa_params.get('c','<c>')}{C.X}")
-        out("")
+                out(f"  {C.CY}    ou: sage (Boneh-Durfee/Coppersmith) | yafu 'factor(<n>)' (ECM){C.X}")
+        # c'est du RSA : on N'ENCHAINE PAS sur les chiffres classiques (les
+        # chiffres de n produiraient un faux flag via crib-dragging XOR).
+        return
 
     # --- Cascade d'encodages (toujours tentee, c'est le plus courant) ---
     out(f"{C.CY}{C.BD}== Cascade de decodage (encodages reversibles) =={C.X}")
