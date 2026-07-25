@@ -478,13 +478,95 @@ def try_nato(s):
         return None
     return ''.join(_NATO[w] for w in words)
 
+# --- lot 3 : Braille, Polybius, Base91, leetspeak ---
+_BRAILLE = {'⠁': 'a', '⠃': 'b', '⠉': 'c', '⠙': 'd', '⠑': 'e', '⠋': 'f', '⠛': 'g',
+            '⠓': 'h', '⠊': 'i', '⠚': 'j', '⠅': 'k', '⠇': 'l', '⠍': 'm', '⠝': 'n',
+            '⠕': 'o', '⠏': 'p', '⠟': 'q', '⠗': 'r', '⠎': 's', '⠞': 't', '⠥': 'u',
+            '⠧': 'v', '⠺': 'w', '⠭': 'x', '⠽': 'y', '⠵': 'z', '⠼': '#', '⠀': ' '}
+_BRAILLE_REV = {v: k for k, v in _BRAILLE.items()}
+
+def try_braille(s):
+    if not any('⠀' <= c <= '⣿' for c in s):
+        return None
+    out = [_BRAILLE.get(c, '?') for c in s if '⠀' <= c <= '⣿']
+    if not out or out.count('?') / len(out) > 0.3:
+        return None
+    return ''.join(out)
+
+# Polybius 5x5 (i/j fusionnes) : chaque lettre = 2 chiffres [1-5][1-5]
+_POLY = "abcdefghiklmnopqrstuvwxyz"   # pas de 'j'
+
+def try_polybius(s):
+    digs = re.sub(r"[^1-5]", "", s)
+    if len(digs) < 4 or len(digs) % 2 != 0 or re.search(r"[6-90]", re.sub(r"\s", "", s)):
+        return None
+    try:
+        out = "".join(_POLY[(int(digs[i]) - 1) * 5 + (int(digs[i + 1]) - 1)]
+                      for i in range(0, len(digs), 2))
+        return out
+    except Exception:
+        return None
+
+# Base91 (basE91 de Joachim Henke)
+_B91 = ("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+        "0123456789!#$%&()*+,./:;<=>?@[]^_`{|}~\"")
+
+def b91decode(s):
+    v, b, n, out = -1, 0, 0, bytearray()
+    for ch in s:
+        if ch not in _B91:
+            continue
+        c = _B91.index(ch)
+        if v < 0:
+            v = c
+        else:
+            v += c * 91
+            b |= v << n
+            n += 13 if (v & 8191) > 88 else 14
+            while n >= 8:
+                out.append(b & 255)
+                b >>= 8
+                n -= 8
+            v = -1
+    if v >= 0:
+        out.append((b | v << n) & 255)
+    return bytes(out)
+
+def b91encode(data):
+    b, n, out = 0, 0, []
+    for byte in data:
+        b |= byte << n
+        n += 8
+        if n > 13:
+            v = b & 8191
+            if v > 88:
+                b >>= 13
+                n -= 13
+            else:
+                v = b & 16383
+                b >>= 14
+                n -= 14
+            out.append(_B91[v % 91] + _B91[v // 91])
+    if n:
+        out.append(_B91[b % 91] + (_B91[b // 91] if n > 7 or b > 90 else ''))
+    return ''.join(out)
+
+_LEET = {'4': 'a', '@': 'a', '8': 'b', '3': 'e', '6': 'g', '1': 'i', '!': 'i',
+         '0': 'o', '9': 'g', '5': 's', '$': 's', '7': 't', '+': 't', '2': 'z'}
+
+def enc_leet(s):
+    rev = {'a': '4', 'b': '8', 'e': '3', 'g': '6', 'i': '1', 'o': '0', 's': '5',
+           't': '7', 'z': '2'}
+    return ''.join(rev.get(c, c) for c in s.lower())
+
 ENCODINGS = [
     ("base64", try_base64), ("base64url", try_base64url), ("base32", try_base32),
     ("base85", try_base85), ("base58", try_base58), ("base45", try_base45),
     ("hex", try_hex), ("binaire", try_binary), ("compression", try_compress),
     ("url", try_url), ("html", try_html_entities), ("unicode", try_unicode_escape),
-    ("decimal", try_decimal), ("morse", try_morse), ("nato", try_nato),
-    ("a1z26", try_a1z26), ("bacon", try_bacon),
+    ("decimal", try_decimal), ("braille", try_braille), ("morse", try_morse),
+    ("nato", try_nato), ("polybius", try_polybius), ("a1z26", try_a1z26),
+    ("bacon", try_bacon),
     ("rot13", try_rot13), ("rot47", try_rot47), ("atbash", try_atbash),
 ]
 
@@ -535,6 +617,11 @@ ENCODERS = {
     "unicode":   lambda s: ''.join(f"\\u{ord(c):04x}" for c in s),
     "nato":      lambda s: ' '.join({v: k for k, v in _NATO.items() if len(k) > 3}.get(c, c)
                                     for c in s.lower()),
+    "braille":   lambda s: ''.join(_BRAILLE_REV.get(c, c) for c in s.lower()),
+    "base91":    lambda s: b91encode(_b(s)),
+    "polybius":  lambda s: ' '.join(f"{_POLY.index(c)//5+1}{_POLY.index(c)%5+1}"
+                                    for c in s.lower().replace('j', 'i') if c in _POLY),
+    "leet":      enc_leet,
     "reverse":   lambda s: s[::-1],
 }
 
@@ -1020,6 +1107,7 @@ def identify_encoding(text):
         ("base64url", try_base64url, 80), ("a1z26", try_a1z26, 78),
         ("hex", try_hex, 76), ("base64", try_base64, 70), ("base58", try_base58, 66),
         ("base85", try_base85, 58),
+        ("braille", try_braille, 97), ("polybius (carre 5x5)", try_polybius, 62),
     ]
     hits = []
     for name, fn, conf in checks:
@@ -1513,6 +1601,39 @@ def get_raw_bytes(s):
     except Exception:
         return s.encode('utf-8', errors='ignore')
 
+_EN_FREQ = {'e':12.7,'t':9.1,'a':8.2,'o':7.5,'i':7.0,'n':6.7,'s':6.3,'h':6.1,
+            'r':6.0,'d':4.3,'l':4.0,'c':2.8,'u':2.8,'m':2.4,'w':2.4,'f':2.2,
+            'g':2.0,'y':2.0,'p':1.9,'b':1.5,'v':1.0,'k':0.8,'j':0.15,'x':0.15,
+            'q':0.10,'z':0.07}
+
+def freq_analysis(text):
+    """Analyse de frequences facon CyberChef : histogramme + IC + diagnostic."""
+    letters = [c.lower() for c in text if c.isalpha()]
+    n = len(letters)
+    if not n:
+        out(f"  {C.Y}Aucune lettre a analyser.{C.X}")
+        return
+    cnt = Counter(letters)
+    ic = index_of_coincidence(text)
+    if ic > 0.061:
+        diag = "monoalphabetique / transposition / clair anglais"
+    elif ic > 0.045:
+        diag = "Vigenere a cle courte (ou langue non-anglaise)"
+    else:
+        diag = "polyalphabetique a cle longue / aleatoire / chiffre fort"
+    out(f"  {C.CY}{n}{C.X} lettres | IC = {C.B}{ic:.4f}{C.X}  {C.GR}({diag}){C.X}")
+    # estimation longueur de cle Vigenere si polyalphabetique probable
+    if ic < 0.061:
+        kl = vigenere_guess_keylength(text)
+        if kl:
+            out(f"  {C.GR}longueur de cle Vigenere probable : {C.B}{kl}{C.X}")
+    out(f"  {C.BD}frequences (observe % | ref. anglais en:%):{C.X}")
+    for ch, c in cnt.most_common():
+        pct = c / n * 100
+        bar = "#" * int(pct)
+        ref = _EN_FREQ.get(ch, 0)
+        out(f"    {C.CY}{ch}{C.X} {pct:5.1f}% {C.GR}{bar}{C.X}  {C.GR}(en:{ref:.1f}%){C.X}")
+
 # ----------------------------------------------------------------------
 # ORCHESTRATION
 # ----------------------------------------------------------------------
@@ -1793,6 +1914,8 @@ Exemples (ENCODAGE) :
     p.add_argument("-e", "--encode", help="ENCODER au lieu de decoder : methode(s) separees par des virgules "
                                           "(ex: base64 ou base64,hex)")
     p.add_argument("--list", action="store_true", help="Liste les methodes d'encodage disponibles")
+    p.add_argument("--freq", action="store_true",
+                   help="Analyse de frequences (lettres + indice de coincidence) facon CyberChef")
     p.add_argument("-I", "--identify", action="store_true",
                    help="IDENTIFIER seulement le type d'encodage (sans tout decoder)")
     p.add_argument("--flag-regex", help="Regex custom du format de flag (defaut: motif générique {...})")
@@ -1821,7 +1944,12 @@ Exemples (ENCODAGE) :
         return sys.stdin.read().rstrip("\n")
 
     try:
-        if args.identify:
+        if args.freq:
+            # MODE ANALYSE DE FREQUENCES
+            text = _read()
+            out(f"{C.B}{C.BD}== Analyse de frequences =={C.X}")
+            freq_analysis(text)
+        elif args.identify:
             # MODE IDENTIFICATION SEULE
             text = _read().strip()
             out(f"{C.B}{C.BD}== Type(s) d'encodage probable(s) =={C.X}")
