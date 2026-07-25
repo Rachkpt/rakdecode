@@ -16,9 +16,12 @@
 #     (hill-climbing + n-grammes) - avec choix du meilleur candidat par score et
 #     filtre anti-faux-flag (fini les 'pwn{rq:tyx|}' coincidants).
 #   - JWT : decode header/payload, detecte alg:none, bruteforce le secret HS256.
+#   - Detecte AES-ECB (blocs de 16 octets repetes dans le ciphertext).
 #   - Identifie le type d'encodage (-I, facon Magic) et le type de hash (hashcat).
 #   - RSA : petit e sans padding, Fermat, Pollard p-1 & rho (offline), common
-#     modulus, Wiener, Hastad broadcast, multi-prime, d/phi fournis, FactorDB.
+#     modulus, Franklin-Reiter (messages lies), Wiener, Hastad broadcast,
+#     multi-prime, d/phi fournis, FactorDB.
+#   (Boneh-Durfee, LLL/NTRU, length-extension : voir SageMath / hashpump.)
 #
 # Ce que cet outil NE fait PAS et ne pretend PAS faire :
 #   - Casser un chiffrement moderne correctement implemente (AES/RSA fort).
@@ -1065,6 +1068,17 @@ def _load_wordlist(limit=50000):
                 pass
     return []
 
+def detect_ecb(raw, block=16):
+    """AES-ECB : des blocs de 16 octets IDENTIQUES dans le ciphertext trahissent
+    le mode ECB (memes blocs de clair -> memes blocs chiffres). Signal fort."""
+    if len(raw) < 2 * block:
+        return None
+    usable = len(raw) - (len(raw) % block)
+    blocks = [raw[i:i + block] for i in range(0, usable, block)]
+    cnt = Counter(blocks)
+    reps = sum(v - 1 for v in cnt.values() if v > 1)
+    return (reps, len(blocks)) if reps > 0 else None
+
 def jwt_analyze(token):
     import hmac, hashlib
     parts = token.strip().split(".")
@@ -1275,6 +1289,66 @@ def rsa_hastad(pairs, e):
     m = iroot(x, e)
     if m is not None and m ** e == x:
         return _m_to_text(m)
+    return None
+
+# --- arithmetique polynomiale mod n (pour Franklin-Reiter / related message) ---
+def _ptrim(p, n):
+    p = [x % n for x in p]
+    while len(p) > 1 and p[-1] == 0:
+        p.pop()
+    return p or [0]
+
+def _psub(a, b, n):
+    m = max(len(a), len(b))
+    return _ptrim([((a[i] if i < len(a) else 0) - (b[i] if i < len(b) else 0))
+                   for i in range(m)], n)
+
+def _pmul(a, b, n):
+    r = [0] * (len(a) + len(b) - 1)
+    for i, ai in enumerate(a):
+        if ai:
+            for j, bj in enumerate(b):
+                r[i + j] = (r[i + j] + ai * bj) % n
+    return _ptrim(r, n)
+
+def _pdivmod(a, b, n):
+    a, b = _ptrim(a[:], n), _ptrim(b[:], n)
+    inv = pow(b[-1], -1, n)                     # ValueError si non inversible -> facteur de n
+    q, r = [0] * max(len(a) - len(b) + 1, 1), a[:]
+    while len(r) - 1 >= len(b) - 1 and r != [0]:
+        d = (len(r) - 1) - (len(b) - 1)
+        coef = (r[-1] * inv) % n
+        q[d] = coef
+        r = _psub(r, [0] * d + [(coef * bi) % n for bi in b], n)
+    return _ptrim(q, n), _ptrim(r, n)
+
+def _pgcd(a, b, n):
+    a, b = _ptrim(a[:], n), _ptrim(b[:], n)
+    while b != [0]:
+        a, b = b, _pdivmod(a, b, n)[1]
+    return a
+
+def franklin_reiter(n, e, c1, c2, a=1, b=1):
+    """Related message : m2 = a*m1 + b (meme n, meme PETIT e) -> le PGCD de
+    (x^e - c1) et ((a*x+b)^e - c2) vaut (x - m1) -> on lit m1."""
+    if not e or e > 100:
+        return None
+    g1 = [(-c1) % n] + [0] * (e - 1) + [1]      # x^e - c1
+    g2 = [1]
+    lin = [b % n, a % n]                        # b + a*x
+    for _ in range(e):
+        g2 = _pmul(g2, lin, n)
+    g2 = _psub(g2, [c2 % n], n)                 # (a*x+b)^e - c2
+    try:
+        g = _pgcd(g1, g2, n)
+    except ValueError:
+        return None
+    if len(g) == 2:                            # gcd lineaire : g0 + g1*x
+        try:
+            m = (-g[0] * pow(g[1], -1, n)) % n
+            return _m_to_text(m)
+        except Exception:
+            return None
     return None
 
 def rsa_wiener(n, e, c):
@@ -1509,6 +1583,16 @@ def run(args):
         out(f"{C.GR}  [i] Pas de cassage de hash automatique ici (necessite wordlist/temps) "
             f"- commande prete ci-dessus.{C.X}\n")
 
+    # --- Detection AES-ECB (blocs de 16 octets repetes dans le ciphertext) ---
+    ecb = detect_ecb(get_raw_bytes(text))
+    if ecb:
+        reps, nblocks = ecb
+        out(f"{C.M}{C.BD}== Detection : AES-ECB probable =={C.X}")
+        out(f"  {C.R}{C.BD}[!] {reps} bloc(s) de 16 octets repete(s) sur {nblocks} "
+            f"-> mode ECB (chaque bloc chiffre independamment).{C.X}")
+        out(f"  {C.GR}Pistes : ECB byte-at-a-time (oracle de chiffrement), cut-and-paste "
+            f"des blocs, ou clair a motifs. Voir les blocs identiques.{C.X}\n")
+
     # --- Detection RSA directe ---
     rsa_params = extract_rsa_params(text)
     # Hastad broadcast : meme petit e, plusieurs (n_i, c_i) -> CRT + racine e-ieme
@@ -1524,6 +1608,28 @@ def run(args):
                 f"  {C.G}[+] dechiffre (Hastad) -> {pt[:200]!r}{C.X}")
             return
         out(f"  {C.Y}[i] Hastad tente mais pas de clair exploitable.{C.X}\n")
+    # Franklin-Reiter : meme n, meme PETIT e, 2 chiffres c1/c2 de messages LIES
+    # (m2 = m1 + b) -> PGCD polynomial. On auto-essaie la relation b.
+    fr_e = rsa_params.get('e')
+    if ('n' in rsa_params and fr_e and 2 <= fr_e <= 100
+            and {'c1', 'c2'} <= set(rsa_params) and 'e1' not in rsa_params):
+        out(f"{C.M}{C.BD}== Detection : RSA Franklin-Reiter (messages lies, e={fr_e}) =={C.X}")
+        nn = rsa_params['n']
+        found = None
+        for bb in [x for r in range(1, 1025) for x in (r, -r)]:
+            pt = franklin_reiter(nn, fr_e, rsa_params['c1'], rsa_params['c2'], 1, bb)
+            if pt and (find_flag(pt, flag_re) or _looks_plaintext(pt)):
+                found = (bb, pt)
+                break
+        if found:
+            bb, pt = found
+            fl = find_flag(pt, flag_re)
+            out(f"  {C.G}{C.BD}[FLAG] {fl}{C.X}  (Franklin-Reiter, m2=m1+{bb})" if fl else
+                f"  {C.G}[+] dechiffre (Franklin-Reiter, m2=m1+{bb}) -> {pt[:200]!r}{C.X}")
+            if fl:
+                return
+        else:
+            out(f"  {C.Y}[i] pas trouve avec |b|<=1024 (donne la relation exacte si tu la connais).{C.X}\n")
     # common modulus : meme n, e1/e2 + c1/c2 -> attaque de Bezout (branchee !)
     if 'n' in rsa_params and {'e1', 'e2', 'c1', 'c2'} <= set(rsa_params):
         out(f"{C.M}{C.BD}== Detection : RSA common modulus (e1/e2 + c1/c2) =={C.X}")
