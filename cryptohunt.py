@@ -1381,22 +1381,26 @@ def rsa_solve(params, flag_re, use_factordb=True):
         _accept(rsa_small_e_attack(n, e, c),
                 f"exposant petit (e={e}) sans padding, racine {e}-ieme entiere")
 
-    # 1bis) factorisation LOCALE puis en ligne, SEULEMENT si rien encore trouve
+    # 1bis) factorisation, dans l'ORDRE du plus rapide au plus lent :
+    #       Fermat -> FactorDB (rapide + gere le multi-prime) -> Pollard (lent, dernier)
     if e and c and not (p and q) and not (d_in or phi_in) and not result["plaintext"]:
-        f = factor_n(n)                       # Fermat -> Pollard p-1 -> Pollard rho
-        if f:
-            p, q = f
-            findings.append(("factorise localement (Fermat/Pollard p-1/rho)", p, q))
-        elif use_factordb:
+        f, src = fermat_factor(n, 100000), "Fermat (premiers proches)"
+        if not f and use_factordb:                       # FactorDB avant Pollard (lent)
             primes = factordb_lookup(n)
             if primes and len(primes) == 2:
-                p, q = primes
-                findings.append(("FactorDB (deja connu publiquement)", p, q))
+                f, src = tuple(primes), "FactorDB"
             elif primes and len(primes) > 2:
                 findings.append((f"FactorDB : n multi-prime ({len(primes)} facteurs)",
                                  primes[0], "..."))
                 _accept(rsa_multiprime(primes, e, c),
                         f"n multi-prime ({len(primes)} facteurs) -> phi = prod(pi-1)")
+        if not f and not result["plaintext"]:            # Pollard p-1 puis rho (local, lent)
+            r = pollard_pm1(n) or pollard_rho(n)
+            if r:
+                f, src = r, "Pollard p-1/rho"
+        if f and not (p and q):
+            p, q = f
+            findings.append((f"factorise ({src})", p, q))
 
     # 2) factorisation connue -> dechiffrement direct
     if p and q and e and c and not result["plaintext"]:
