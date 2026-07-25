@@ -11,13 +11,14 @@
 #     unicode, NATO, a1z26, bacon, rot13/47, atbash, gzip/zlib/bz2).
 #   - ENCODE aussi (mode -e) : applique une ou plusieurs methodes en chaine
 #     (ex: -e base64,hex). Voir --list.
-#   - Casse les chiffrements CLASSIQUES FAIBLES : Cesar, Affine, Rail fence,
-#     XOR (simple/repete/crib), Vigenere - bruteforce + analyse frequentielle,
-#     avec choix du meilleur candidat par score (fini les faux 'ctf{...}').
-#   - Identifie le type de hash et donne la commande hashcat exacte.
-#   - RSA : exposant petit sans padding, Fermat (premiers proches), common
-#     modulus, Wiener (d petit), Hastad broadcast (meme e, N messages),
-#     multi-prime, d/phi fournis, FactorDB - avec verification du clair.
+#   - Casse les chiffrements CLASSIQUES : Cesar, Affine, Rail fence, XOR (simple/
+#     repete/crib), Vigenere (chi-carre + dico), SUBSTITUTION monoalphabetique
+#     (hill-climbing + n-grammes) - avec choix du meilleur candidat par score et
+#     filtre anti-faux-flag (fini les 'pwn{rq:tyx|}' coincidants).
+#   - JWT : decode header/payload, detecte alg:none, bruteforce le secret HS256.
+#   - Identifie le type d'encodage (-I, facon Magic) et le type de hash (hashcat).
+#   - RSA : petit e sans padding, Fermat, Pollard p-1 & rho (offline), common
+#     modulus, Wiener, Hastad broadcast, multi-prime, d/phi fournis, FactorDB.
 #
 # Ce que cet outil NE fait PAS et ne pretend PAS faire :
 #   - Casser un chiffrement moderne correctement implemente (AES/RSA fort).
@@ -101,6 +102,18 @@ def find_flag(text, pattern):
         return None
     m = pattern.search(text)
     return m.group(0) if m else None
+
+def _clean_flag(f):
+    """Un VRAI flag a un contenu propre (alphanumerique + _ - . !). Un match
+    coincidant sur un mauvais decalage/cle contient des symboles bizarres
+    (rq:tyx| ...) -> permet de rejeter les faux positifs des bruteforces."""
+    if not f or '{' not in f:
+        return False
+    inside = f[f.find('{') + 1:f.rfind('}')]
+    if not inside:
+        return False
+    good = sum(1 for c in inside if c.isalnum() or c in "_-.! ")
+    return good / len(inside) >= 0.8
 
 # ----------------------------------------------------------------------
 # Scoring frequentiel (anglais) - sert a Cesar / XOR / Vigenere
@@ -263,10 +276,10 @@ def try_rot13(s):
         string.ascii_uppercase[13:] + string.ascii_uppercase[:13]))
     if r == s:
         return None
-    # N'accepte que si ca ameliore reellement la vraisemblance du texte -
-    # sinon rot13 se declenche a tort sur du hex/base32 qui contient par
-    # hasard des lettres a-f, detruisant l'encodage avant qu'il soit lu.
-    if english_score(r) > english_score(s) + 1.0:
+    # N'accepte que si le resultat ressemble VRAIMENT a du texte (score > 0) ET
+    # ameliore la vraisemblance - sinon rot13 se declenche a tort sur du hex/
+    # base32/garbage qui contient par hasard des lettres, corrompant la suite.
+    if english_score(r) > 0 and english_score(r) > english_score(s) + 1.0:
         return r
     return None
 
@@ -335,7 +348,9 @@ def atbash(s):
 
 def try_atbash(s):
     r = atbash(s)
-    if r != s and english_score(r) > english_score(s) + 1.0:
+    # ne se declenche QUE si le resultat ressemble VRAIMENT a du texte (score > 0)
+    # -> evite de corrompre du ciphertext/garbage dans la cascade
+    if r != s and english_score(r) > 0 and english_score(r) > english_score(s) + 1.0:
         return r
     return None
 
@@ -344,7 +359,7 @@ def rot47(s):
 
 def try_rot47(s):
     r = rot47(s)
-    if r != s and english_score(r) > english_score(s) + 1.0:
+    if r != s and english_score(r) > 0 and english_score(r) > english_score(s) + 1.0:
         return r
     return None
 
@@ -594,22 +609,22 @@ def xor_bytes(data, key):
     return bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
 
 def xor_single_byte_crack(data, flag_re):
-    best = None
+    scored = []
     for k in range(256):
-        cand = xor_bytes(data, bytes([k]))
         try:
-            s = cand.decode('utf-8')
+            s = xor_bytes(data, bytes([k])).decode('utf-8')
         except Exception:
             continue
-        score = english_score(s)
-        f = find_flag(s, flag_re)
-        if f:
-            return f, k, s
-        if best is None or score > best[2]:
-            best = (k, s, score)
-    if best:
-        return None, best[0], best[1]
-    return None, None, None
+        scored.append((k, s, text_fitness(s)))
+    if not scored:
+        return None, None, None
+    # flag PROPRE prioritaire (evite 'pwn{rq:tyx|}' coincidant) ; sinon meilleur score
+    hits = [x for x in scored if _clean_flag(find_flag(x[1], flag_re))]
+    if hits:
+        k, s, _ = max(hits, key=lambda x: x[2])
+        return find_flag(s, flag_re), k, s
+    k, s, _ = max(scored, key=lambda x: x[2])
+    return None, k, s
 
 def hamming_distance(a, b):
     return bin(int.from_bytes(a, 'big') ^ int.from_bytes(b, 'big')).count('1')
@@ -833,7 +848,7 @@ def _best_flag_or_score(cands, flag_re):
     celui au MEILLEUR score (evite un 'ctf{garbage}' coincidant) ; sinon renvoie
     le meilleur score global. Utilise text_fitness (lettres + mots reels)."""
     scored = [(k, d, text_fitness(d)) for k, d in cands]
-    hits = [(k, d, sc) for k, d, sc in scored if find_flag(d, flag_re)]
+    hits = [(k, d, sc) for k, d, sc in scored if _clean_flag(find_flag(d, flag_re))]
     if hits:
         k, d, _ = max(hits, key=lambda x: x[2])
         return find_flag(d, flag_re), k, d
@@ -872,6 +887,97 @@ def railfence_crack(s, flag_re, max_rails=12):
     cands = [(r, railfence_decode(s, r))
              for r in range(2, min(max_rails, len(s) - 1) + 1)]
     return _best_flag_or_score(cands, flag_re)
+
+# ----------------------------------------------------------------------
+# COUCHE 4ter - Substitution monoalphabetique (hill-climbing + n-grammes)
+# ----------------------------------------------------------------------
+_CORPUS = ((
+    "the quick brown fox jumps over the lazy dog while the cryptographer smiles "
+    "softly and thinks about the secret message hidden in plain sight for anyone "
+    "who knows where to look because information wants to be free and knowledge is "
+    "power in the hands of those who understand how these systems really work under "
+    "the surface where the true meaning of every word and letter matters more than "
+    "you would expect from such a simple looking string of characters that seems "
+    "random at first but reveals its structure once you apply the right technique "
+    "and a little patience together with careful analysis of the frequencies and "
+    "patterns that appear again and again throughout the english language which is "
+    "full of common words like the and that with have this from they will have been "
+    "when there their what about which would other into time could people than only "
+    "over also back after use two how our work first well way even new want because "
+    "any these give day most people should never underestimate the value of reading "
+    "carefully and thinking clearly before making an important decision that could "
+    "change everything they have worked so hard to build over many long years of "
+    "effort and sacrifice for their family and friends who always believed in them "
+    "no matter what happened along the difficult road that led them to this moment "
+    "where they finally understand that the journey itself was the real reward all "
+    "along and that success is measured not by what you have but by who you become "
+    "as you learn to face your fears and overcome the many obstacles life throws at "
+    "you every single day without warning or mercy but with endless opportunity to "
+    "grow stronger wiser and kinder than you were the day before when you first "
+    "started this incredible adventure that we call being alive and human on this "
+    "small blue planet spinning quietly through the vast and silent darkness of space"
+) * 2)
+
+def _build_ngrams(text, N):
+    t = re.sub(r'[^a-z]', '', text.lower())
+    cnt = Counter(t[i:i + N] for i in range(len(t) - N + 1))
+    total = sum(cnt.values()) or 1
+    logp = {g: math.log10(c / total) for g, c in cnt.items()}
+    return logp, math.log10(0.01 / total)
+
+_QUAD_LOGP, _QUAD_FLOOR = _build_ngrams(_CORPUS, 4)
+_TRI_LOGP, _TRI_FLOOR = _build_ngrams(_CORPUS, 3)
+_BI_LOGP, _BI_FLOOR = _build_ngrams(_CORPUS, 2)
+
+def _ngram_fitness(text):
+    t = re.sub(r'[^a-z]', '', text.lower())
+    if len(t) < 4:
+        return -1e9
+    # quadgrammes (fort) + trigrammes + bigrammes (lisse le paysage pour le hill-climb)
+    s4 = sum(_QUAD_LOGP.get(t[i:i + 4], _QUAD_FLOOR) for i in range(len(t) - 3))
+    s3 = sum(_TRI_LOGP.get(t[i:i + 3], _TRI_FLOOR) for i in range(len(t) - 2))
+    s2 = sum(_BI_LOGP.get(t[i:i + 2], _BI_FLOOR) for i in range(len(t) - 1))
+    return s4 + 0.5 * s3 + 0.2 * s2
+
+def substitution_crack(s, flag_re, restarts=25, iters=2600):
+    """Casse une substitution monoalphabetique par hill-climbing : part d'une
+    cle aleatoire, echange 2 lettres tant que le score n-grammes s'ameliore ;
+    plusieurs restarts pour eviter les optima locaux."""
+    import random
+    L = string.ascii_lowercase
+    fit_src = s[:800]                          # cap pour la vitesse
+
+    def apply(key, text):
+        return text.translate(str.maketrans(L + L.upper(), key + key.upper()))
+
+    best = None
+    for _ in range(restarts):
+        key = list(L)
+        random.shuffle(key)
+        cur_key = ''.join(key)
+        cur_sc = _ngram_fitness(apply(cur_key, fit_src))
+        it, improved = 0, True
+        while improved and it < iters:
+            improved = False
+            for a in range(26):
+                for b in range(a + 1, 26):
+                    k = list(cur_key)
+                    k[a], k[b] = k[b], k[a]
+                    nk = ''.join(k)
+                    sc = _ngram_fitness(apply(nk, fit_src))
+                    if sc > cur_sc:
+                        cur_key, cur_sc, improved = nk, sc, True
+                    it += 1
+                if it >= iters:
+                    break
+        dec = apply(cur_key, s)
+        if best is None or cur_sc > best[2]:
+            best = (cur_key, dec, cur_sc)
+        if find_flag(dec, flag_re):
+            return find_flag(dec, flag_re), cur_key, dec
+    if best:
+        return find_flag(best[1], flag_re), best[0], best[1]
+    return None, None, None
 
 # ----------------------------------------------------------------------
 # COUCHE 5 - Identification de hash
@@ -935,6 +1041,57 @@ def identify_encoding(text):
                      40, "-> essaie le decodage complet"))
     hits.sort(key=lambda x: -x[1])
     return hits
+
+# ----------------------------------------------------------------------
+# JWT : decode header/payload + alg:none + bruteforce du secret HS*
+# ----------------------------------------------------------------------
+JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]{4,}\.eyJ[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]*")
+JWT_SECRETS = ["secret", "password", "123456", "key", "jwt", "admin", "changeme",
+               "your-256-bit-secret", "supersecret", "s3cr3t", "secretkey",
+               "private", "flag", "test", "token", "pass", "qwerty", "letmein",
+               "root", "12345678", "P@ssw0rd", "1234567890"]
+
+def _b64url_dec(s):
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+def _load_wordlist(limit=50000):
+    for path in ("/usr/share/wordlists/rockyou.txt",
+                 "/usr/share/seclists/Passwords/Leaked-Databases/rockyou.txt"):
+        if os.path.isfile(path):
+            try:
+                with open(path, encoding="utf-8", errors="ignore") as f:
+                    return [l.rstrip("\n") for _, l in zip(range(limit), f)]
+            except Exception:
+                pass
+    return []
+
+def jwt_analyze(token):
+    import hmac, hashlib
+    parts = token.strip().split(".")
+    if len(parts) < 2:
+        return None
+    try:
+        header = json.loads(_b64url_dec(parts[0]))
+        payload = json.loads(_b64url_dec(parts[1]))
+    except Exception:
+        return None
+    alg = str(header.get("alg", "")).upper()
+    info = {"header": header, "payload": payload, "alg": header.get("alg"),
+            "none_forgery": None, "secret": None}
+    if alg == "NONE":
+        info["none_forgery"] = f"{parts[0]}.{parts[1]}."
+    if alg.startswith("HS") and len(parts) == 3:
+        hfn = {"HS256": hashlib.sha256, "HS384": hashlib.sha384,
+               "HS512": hashlib.sha512}.get(alg, hashlib.sha256)
+        signing_input = f"{parts[0]}.{parts[1]}".encode()
+        secrets = list(dict.fromkeys(JWT_SECRETS + _load_wordlist()))
+        for sec in secrets:
+            sig = base64.urlsafe_b64encode(
+                hmac.new(sec.encode(), signing_input, hfn).digest()).rstrip(b"=").decode()
+            if sig == parts[2]:
+                info["secret"] = sec
+                break
+    return info
 
 # ----------------------------------------------------------------------
 # COUCHE 6 - RSA faible (detection auto n/e/c + attaques courantes)
@@ -1005,6 +1162,50 @@ def fermat_factor(n, max_iter=200000):
             if p * q == n and p > 1 and q > 1:
                 return p, q
         a += 1
+    return None
+
+def pollard_pm1(n, B=200000):
+    """Pollard p-1 : factorise si p-1 est 'lisse' (petits facteurs). Offline."""
+    a = 2
+    for j in range(2, B):
+        a = pow(a, j, n)
+        if j % 256 == 0:
+            d = math.gcd(a - 1, n)
+            if 1 < d < n:
+                return d, n // d
+    d = math.gcd(a - 1, n)
+    return (d, n // d) if 1 < d < n else None
+
+def pollard_rho(n, max_tries=6):
+    """Pollard rho (Brent) : trouve un petit facteur rapidement. Offline."""
+    import random
+    if n % 2 == 0:
+        return 2, n // 2
+    for _ in range(max_tries):
+        x = random.randrange(2, n - 1)
+        y, c, d = x, random.randrange(1, n - 1), 1
+        cnt = 0
+        while d == 1 and cnt < 1 << 20:
+            x = (x * x + c) % n
+            y = (y * y + c) % n
+            y = (y * y + c) % n
+            d = math.gcd(abs(x - y), n)
+            cnt += 1
+        if 1 < d < n:
+            return d, n // d
+    return None
+
+def factor_n(n):
+    """Tente de factoriser n localement : Fermat -> Pollard p-1 -> Pollard rho."""
+    for fn in (lambda: fermat_factor(n, 100000),
+               lambda: pollard_pm1(n),
+               lambda: pollard_rho(n)):
+        try:
+            r = fn()
+        except Exception:
+            r = None
+        if r and r[0] * r[1] == n and r[0] > 1 and r[1] > 1:
+            return r
     return None
 
 def _egcd(a, b):
@@ -1145,10 +1346,10 @@ def rsa_solve(params, flag_re, use_factordb=True):
     if p and q:
         findings.append(("p/q deja fournis", p, q))
     elif not (d_in or phi_in):
-        f = fermat_factor(n)
+        f = factor_n(n)                       # Fermat -> Pollard p-1 -> Pollard rho (offline)
         if f:
             p, q = f
-            findings.append(("Fermat (premiers proches)", p, q))
+            findings.append(("factorise localement (Fermat/Pollard p-1/rho)", p, q))
         elif use_factordb:
             primes = factordb_lookup(n)
             if primes and len(primes) == 2:
@@ -1267,6 +1468,32 @@ def run(args):
                 + (f"  {C.GR}-> {preview!r}{C.X}" if preview else ""))
         out("")
 
+    # --- JWT (structure distinctive : eyJ....eyJ....sig) ---
+    jm = JWT_RE.search(text)
+    if jm:
+        info = jwt_analyze(jm.group(0))
+        if info:
+            out(f"{C.M}{C.BD}== Detection : JSON Web Token (JWT) =={C.X}")
+            out(f"  {C.CY}header  : {info['header']}{C.X}")
+            out(f"  {C.CY}payload : {info['payload']}{C.X}")
+            if info["none_forgery"]:
+                out(f"  {C.R}{C.BD}[!] alg=none -> forge un token SANS signature :{C.X}")
+                out(f"  {C.G}    {info['none_forgery']}{C.X}")
+            if info["secret"]:
+                out(f"  {C.G}{C.BD}[+] secret HS trouve : '{info['secret']}'{C.X}"
+                    f"  {C.GR}-> tu peux forger n'importe quel token{C.X}")
+                fl = find_flag(json.dumps(info["payload"]) + info["secret"], flag_re)
+                if fl:
+                    out(f"  {C.G}{C.BD}[FLAG] {fl}{C.X}")
+            elif str(info.get("alg", "")).upper().startswith("HS"):
+                out(f"  {C.Y}[i] secret HS non trouve (dico + rockyou si present). "
+                    f"Essaie une wordlist plus grande.{C.X}")
+            fl = find_flag(json.dumps(info["payload"]), flag_re)
+            if fl:
+                out(f"  {C.G}{C.BD}[FLAG] {fl}{C.X}")
+                return
+            out("")
+
     # --- Detection hash directe (rapide, avant la cascade) ---
     hash_matches = identify_hash(text)
     if hash_matches:
@@ -1369,8 +1596,10 @@ def run(args):
     if key:
         out(f"  {C.GR}meilleur candidat (rails={key}) : {cand[:100]!r}{C.X}\n")
 
-    # --- XOR (simple puis cle repetee, sur les octets bruts du ciphertext) ---
-    raw_bytes = get_raw_bytes(working_text)
+    # --- XOR (simple puis cle repetee) : on repart de l'ENTREE D'ORIGINE (hex/
+    #     base64 du ciphertext), PAS du working_text sur-decode par la cascade
+    #     (rot47/atbash peuvent l'avoir corrompu). ---
+    raw_bytes = get_raw_bytes(text)
 
     out(f"{C.CY}{C.BD}== XOR cle simple (1 octet, bruteforce 256) =={C.X}")
     flag, key, cand = xor_single_byte_crack(raw_bytes, flag_re)
@@ -1401,6 +1630,18 @@ def run(args):
         return
     if key:
         out(f"  {C.GR}meilleur candidat (cle={key}) : {cand[:100]!r}{C.X}\n")
+
+    # --- Substitution monoalphabetique (hill-climbing) : seulement si ca ressemble
+    #     a du texte alpha (sinon inutile et lent) ---
+    alpha = [c for c in working_text if c.isalpha()]
+    if 20 <= len(alpha) <= 3000 and len(alpha) / max(len(working_text), 1) > 0.5:
+        out(f"{C.CY}{C.BD}== Substitution monoalphabetique (hill-climbing) =={C.X}")
+        flag, key, cand = substitution_crack(working_text, flag_re)
+        if flag:
+            out(f"{C.G}{C.BD}[FLAG] {flag}{C.X}")
+            return
+        if cand:
+            out(f"  {C.GR}meilleur candidat : {cand[:100]!r}{C.X}\n")
 
     # --- Rien trouve : verdict honnete ---
     out(f"{C.Y}{C.BD}== Aucun flag trouve par les methodes automatiques =={C.X}")
